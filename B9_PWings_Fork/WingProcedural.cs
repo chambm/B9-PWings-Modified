@@ -1118,6 +1118,120 @@ namespace WingProcedural
 
         #endregion Split trailing edge into control surface
 
+        #region Follow parent wing
+
+        // Keeps an attached control surface tracking its parent wing's span/sweep/position
+        // (editor only) while keeping its own shape (trailing-edge width + edge type). The
+        // wing->control mapping is the same one the split derives: length = swept-TE length,
+        // offset = -tan(sweep), pose = trailing-edge midspan + sweep tilt. te-width is NOT
+        // re-derived - the split zeroed the wing's te, so the wing no longer carries it, and
+        // keeping the control's te is the "keep shape" behaviour.
+        private bool fpInit = false;
+        private float fpLen, fpWR, fpWT, fpOR, fpOT;
+        // The control's span as FRACTIONS of the wing's trailing edge: how long it is
+        // (lengthFrac) and where its centre sits relative to TE midspan (centreFrac, in
+        // -0.5..+0.5 along the TE). Preserving these is what keeps a flaps/aileron setup
+        // intact - each piece owns a portion of the edge, not the whole thing.
+        private float fpLengthFrac = 1f, fpCentreFrac = 0f;
+        // The control's rotation expressed IN the wing's trailing-edge frame. Re-applying
+        // this to the rebuilt frame tracks sweep without ever re-orienting the control
+        // itself - so a control keeps whichever way round it already sits.
+        private Quaternion fpRelRot = Quaternion.identity;
+
+        private void FollowParentWing()
+        {
+            if (!HighLogic.LoadedSceneIsEditor || !isCtrlSrf || !isAttached || bisectMode)
+                return;
+            if (part.parent == null || !part.parent.Modules.Contains<WingProcedural>())
+                return;
+            WingProcedural wing = FirstOfTypeOrDefault<WingProcedural>(part.parent.Modules);
+            if (wing == null || wing.isCtrlSrf)
+                return;
+
+            bool changed =
+                wing.sharedBaseLength != fpLen
+                || wing.sharedBaseWidthRoot != fpWR || wing.sharedBaseWidthTip != fpWT
+                || wing.sharedBaseOffsetRoot != fpOR || wing.sharedBaseOffsetTip != fpOT;
+
+            fpLen = wing.sharedBaseLength;
+            fpWR = wing.sharedBaseWidthRoot; fpWT = wing.sharedBaseWidthTip;
+            fpOR = wing.sharedBaseOffsetRoot; fpOT = wing.sharedBaseOffsetTip;
+
+            // While the wing is untouched, keep re-reading where this control sits on the
+            // edge, so moving/resizing it by hand redefines what gets preserved. The first
+            // pass lands here too, so loading a craft never reshapes anything.
+            if (!fpInit || !changed)
+            {
+                fpInit = true;
+                CaptureSpanFractions(wing);
+                return;
+            }
+
+            ApplyFollow(wing);
+        }
+
+        // Trailing-edge frame of the wing, in the wing's PART transform space:
+        // X = span (root at 0 -> tip at +length), Y = chord (trailing edge at -TZ),
+        // Z = thickness. That's the convention the gizmo drag code and
+        // TrailingEdgeMidspanWorld use - NOT the mesh builder's frame (which is
+        // X=thickness, Y=chord, Z=span; the mesh child is rotated relative to the part).
+        private void TrailingEdgeFrame(WingProcedural wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ)
+        {
+            float rootTZ = wing.sharedBaseWidthRoot * 0.5f - wing.sharedBaseOffsetRoot;
+            float tipTZ = wing.sharedBaseWidthTip * 0.5f + wing.sharedBaseOffsetTip;
+            dTZ = rootTZ - tipTZ;
+            teDirLocal = new Vector3(wing.sharedBaseLength, dTZ, 0f).normalized;
+            teMid = wing.TrailingEdgeMidspanWorld();
+            teLen = Mathf.Sqrt(wing.sharedBaseLength * wing.sharedBaseLength + dTZ * dTZ);
+        }
+
+        private void CaptureSpanFractions(WingProcedural wing)
+        {
+            TrailingEdgeFrame(wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float _);
+            if (teLen < 1e-4f)
+                return;
+            Vector3 teDir = wing.part.transform.TransformDirection(teDirLocal);
+            fpLengthFrac = sharedBaseLength / teLen;
+            fpCentreFrac = Vector3.Dot(part.transform.position - teMid, teDir) / teLen;
+            fpRelRot = Quaternion.Inverse(TrailingEdgeFrameWorld(wing, teDirLocal)) * part.transform.rotation;
+        }
+
+        // Orthonormal frame sitting on the wing's trailing edge: forward = along the edge,
+        // up = the wing's thickness axis (part-local Z, perpendicular to the edge since the
+        // edge lies in the span/chord plane).
+        private Quaternion TrailingEdgeFrameWorld(WingProcedural wing, Vector3 teDirLocal)
+        {
+            return wing.part.transform.rotation * Quaternion.LookRotation(teDirLocal, Vector3.forward);
+        }
+
+        private void ApplyFollow(WingProcedural wing)
+        {
+            TrailingEdgeFrame(wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ);
+            if (wing.sharedBaseLength < 1e-4f || teLen < 1e-4f)
+                return;
+            Vector3 teDir = wing.part.transform.TransformDirection(teDirLocal);
+
+            // Rebuild the edge frame and re-apply the control's stored rotation WITHIN it.
+            // This is absolute (no roll drift, unlike an incremental FromToRotation delta,
+            // which leaves roll about the span free), yet it never re-orients the control
+            // itself - so a hand-placed or mirrored control keeps whichever way round it
+            // sits. Snapping to CtrlSrfRotationForWing instead forces the freshly-split
+            // pose onto every control, which flipped root/tip end-for-end.
+            part.transform.rotation = TrailingEdgeFrameWorld(wing, teDirLocal) * fpRelRot;
+
+            // Keep this control's slice of the edge: same fraction of the length, same
+            // station along it. Thickness / te-width are its own shape - left alone.
+            part.transform.position = teMid + teDir * (fpCentreFrac * teLen);
+            sharedBaseLength = fpLengthFrac * teLen;
+            sharedBaseOffsetRoot = -dTZ / wing.sharedBaseLength;
+            sharedBaseOffsetTip = sharedBaseOffsetRoot;
+
+            // Field changes are picked up by CheckAllFieldValues later this frame, which
+            // fires UpdateGeometry; no explicit call needed here.
+        }
+
+        #endregion Follow parent wing
+
         #region Bisect control surface
 
         // Interactive "bisect": click the button, mouse over the surface to place a
@@ -1881,6 +1995,10 @@ namespace WingProcedural
                 BisectUpdate();
                 return;
             }
+
+            // Control surfaces track their parent wing's span/sweep/pose (edits its shared
+            // fields + transform); the CheckAllFieldValues below then fires the geometry rebuild.
+            FollowParentWing();
 
             DeformWing();
             CheckAllFieldValues(out bool updateGeo, out bool updateAero);
