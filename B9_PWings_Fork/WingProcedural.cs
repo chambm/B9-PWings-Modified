@@ -774,11 +774,88 @@ namespace WingProcedural
 
         #region Split trailing edge into control surface
 
-        // Name of the procedural control-surface part (TypeB) we spawn. KSP's
+        // Name of the stock procedural control-surface part (TypeB). KSP's
         // PartLoader keys parts with '.' in place of the cfg's '_', so the dotted
         // form is what getPartInfoByName wants; keep the underscore form as fallback.
         private const string ctrlSrfPartName = "B9.Aero.Wing.Procedural.TypeB";
         private const string ctrlSrfPartNameCfg = "B9_Aero_Wing_Procedural_TypeB";
+
+        // Resolved control surface per source part, keyed by that part's name.
+        private static readonly Dictionary<string, AvailablePart> ctrlSrfPartCache = new Dictionary<string, AvailablePart>();
+
+        /// <summary>
+        /// The stock TypeB control surface, or null if it isn't loaded.
+        /// </summary>
+        private static AvailablePart StockCtrlSrfPart()
+        {
+            return PartLoader.getPartInfoByName(ctrlSrfPartName)
+                ?? PartLoader.getPartInfoByName(ctrlSrfPartNameCfg);
+        }
+
+        /// <summary>
+        /// The procedural control-surface part that matches <paramref name="source"/>.
+        /// Other mods clone the stock parts into rated variants - Realism Overhaul
+        /// ships Early / Supersonic / Spaceplane sets of wing AND control surface -
+        /// so splitting a supersonic wing has to produce a supersonic control surface,
+        /// not the stock one.
+        ///
+        /// The variants follow no fixed naming scheme, so rather than hardcode any
+        /// mod's names we score every loaded procedural control surface by how much
+        /// of its name it shares with the source part at each end: the common prefix
+        /// identifies the family ("RO-B9Proc") and the common suffix the variant
+        /// ("-Supersonic"). Best score wins; stock TypeB is the fallback.
+        /// </summary>
+        private AvailablePart ResolveCtrlSrfPart(Part source)
+        {
+            string sourceName = source != null && source.partInfo != null ? source.partInfo.name : null;
+            if (string.IsNullOrEmpty(sourceName))
+                return StockCtrlSrfPart();
+
+            if (ctrlSrfPartCache.TryGetValue(sourceName, out AvailablePart cached))
+                return cached;
+
+            AvailablePart best = null;
+            int bestScore = -1;
+            List<AvailablePart> loaded = PartLoader.LoadedPartsList;
+            for (int i = 0; loaded != null && i < loaded.Count; ++i)
+            {
+                AvailablePart ap = loaded[i];
+                if (ap == null || ap.partPrefab == null)
+                    continue;
+                // Only a plain control surface will do: an all-moving wing (TypeC)
+                // reports isCtrlSrf false, so this rejects it as well as any wing.
+                WingProcedural wp = FirstOfTypeOrDefault<WingProcedural>(ap.partPrefab.Modules);
+                if (wp == null || !wp.isCtrlSrf)
+                    continue;
+                int score = CommonAffixLength(sourceName, ap.name);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = ap;
+                }
+            }
+
+            if (best == null)
+                best = StockCtrlSrfPart();
+            ctrlSrfPartCache[sourceName] = best;
+            return best;
+        }
+
+        /// <summary>
+        /// Characters the two names share at the start plus those they share at the
+        /// end, never counting a character twice.
+        /// </summary>
+        private static int CommonAffixLength(string a, string b)
+        {
+            int max = Mathf.Min(a.Length, b.Length);
+            int prefix = 0;
+            while (prefix < max && a[prefix] == b[prefix])
+                ++prefix;
+            int suffix = 0;
+            while (suffix < max - prefix && a[a.Length - 1 - suffix] == b[b.Length - 1 - suffix])
+                ++suffix;
+            return prefix + suffix;
+        }
 
         // --- Automatic placement (manual editor-part registration) ---
         // Registers + surface-attaches a control surface WITHOUT going through the editor
@@ -1005,8 +1082,9 @@ namespace WingProcedural
             if (EditorLogic.fetch == null)
                 return;
 
-            AvailablePart ap = PartLoader.getPartInfoByName(ctrlSrfPartName)
-                            ?? PartLoader.getPartInfoByName(ctrlSrfPartNameCfg);
+            // Match the wing's own variant, so a supersonic wing splits into a
+            // supersonic control surface rather than the stock one.
+            AvailablePart ap = ResolveCtrlSrfPart(part);
             if (ap == null)
             {
                 Debug.LogError("[B9PW] Split: control surface part not found");
@@ -1440,8 +1518,8 @@ namespace WingProcedural
                 CopyColoursBySection(part, cs.part);
             };
 
-            AvailablePart ap = PartLoader.getPartInfoByName(ctrlSrfPartName)
-                            ?? PartLoader.getPartInfoByName(ctrlSrfPartNameCfg);
+            // Both halves must stay the same part as the surface being bisected.
+            AvailablePart ap = part.partInfo ?? ResolveCtrlSrfPart(part);
             if (ap == null)
             {
                 Debug.LogError("[B9PW] Bisect: control surface part not found");
