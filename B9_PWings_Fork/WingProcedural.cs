@@ -772,6 +772,947 @@ namespace WingProcedural
 
         #endregion Inheritance
 
+        #region Split trailing edge into control surface
+
+        // Name of the stock procedural control-surface part (TypeB). KSP's
+        // PartLoader keys parts with '.' in place of the cfg's '_', so the dotted
+        // form is what getPartInfoByName wants; keep the underscore form as fallback.
+        private const string ctrlSrfPartName = "B9.Aero.Wing.Procedural.TypeB";
+        private const string ctrlSrfPartNameCfg = "B9_Aero_Wing_Procedural_TypeB";
+
+        // Resolved control surface per source part, keyed by that part's name.
+        private static readonly Dictionary<string, AvailablePart> ctrlSrfPartCache = new Dictionary<string, AvailablePart>();
+
+        /// <summary>
+        /// The stock TypeB control surface, or null if it isn't loaded.
+        /// </summary>
+        private static AvailablePart StockCtrlSrfPart()
+        {
+            return PartLoader.getPartInfoByName(ctrlSrfPartName)
+                ?? PartLoader.getPartInfoByName(ctrlSrfPartNameCfg);
+        }
+
+        /// <summary>
+        /// The procedural control-surface part that matches <paramref name="source"/>.
+        /// Other mods clone the stock parts into rated variants - Realism Overhaul
+        /// ships Early / Supersonic / Spaceplane sets of wing AND control surface -
+        /// so splitting a supersonic wing has to produce a supersonic control surface,
+        /// not the stock one.
+        ///
+        /// The variants follow no fixed naming scheme, so rather than hardcode any
+        /// mod's names we score every loaded procedural control surface by how much
+        /// of its name it shares with the source part at each end: the common prefix
+        /// identifies the family ("RO-B9Proc") and the common suffix the variant
+        /// ("-Supersonic"). Best score wins; stock TypeB is the fallback.
+        /// </summary>
+        private AvailablePart ResolveCtrlSrfPart(Part source)
+        {
+            string sourceName = source != null && source.partInfo != null ? source.partInfo.name : null;
+            if (string.IsNullOrEmpty(sourceName))
+                return StockCtrlSrfPart();
+
+            if (ctrlSrfPartCache.TryGetValue(sourceName, out AvailablePart cached))
+                return cached;
+
+            AvailablePart best = null;
+            int bestScore = -1;
+            List<AvailablePart> loaded = PartLoader.LoadedPartsList;
+            for (int i = 0; loaded != null && i < loaded.Count; ++i)
+            {
+                AvailablePart ap = loaded[i];
+                if (ap == null || ap.partPrefab == null)
+                    continue;
+                // Only a plain control surface will do: an all-moving wing (TypeC)
+                // reports isCtrlSrf false, so this rejects it as well as any wing.
+                WingProcedural wp = FirstOfTypeOrDefault<WingProcedural>(ap.partPrefab.Modules);
+                if (wp == null || !wp.isCtrlSrf)
+                    continue;
+                int score = CommonAffixLength(sourceName, ap.name);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = ap;
+                }
+            }
+
+            if (best == null)
+                best = StockCtrlSrfPart();
+            ctrlSrfPartCache[sourceName] = best;
+            return best;
+        }
+
+        /// <summary>
+        /// Characters the two names share at the start plus those they share at the
+        /// end, never counting a character twice.
+        /// </summary>
+        private static int CommonAffixLength(string a, string b)
+        {
+            int max = Mathf.Min(a.Length, b.Length);
+            int prefix = 0;
+            while (prefix < max && a[prefix] == b[prefix])
+                ++prefix;
+            int suffix = 0;
+            while (suffix < max - prefix && a[a.Length - 1 - suffix] == b[b.Length - 1 - suffix])
+                ++suffix;
+            return prefix + suffix;
+        }
+
+        // --- Automatic placement (manual editor-part registration) ---
+        // Registers + surface-attaches a control surface WITHOUT going through the editor
+        // FSM (driving the FSM's private attach from outside desynced it before). Grounded
+        // in public API: FlightGlobals.GetUniquepersistentId (unique ids - a persistentId
+        // collision was the earlier FAR crash), ship.Add, InitializeModules. Returns the
+        // attached part, or null on failure so callers fall back to one-click place.
+        // NOTE: unverified in-game as of first write; symmetry counterparts are attached
+        // as independent parts (not KSP-symmetry-linked).
+        private Part AttachCtrlSrfTo(AvailablePart ap, Part parentWing, Vector3 pos, Quaternion rot, Action<WingProcedural> configure)
+        {
+            Part p = (Part)UnityEngine.Object.Instantiate(ap.partPrefab);
+            p.gameObject.SetActive(true);
+            p.name = ap.name;
+            p.partInfo = ap;
+            p.persistentId = FlightGlobals.GetUniquepersistentId();
+            p.craftID = FlightGlobals.GetUniquepersistentId();
+
+            p.transform.position = pos;
+            p.transform.rotation = rot;
+            p.transform.SetParent(parentWing.transform, true);
+
+            // Link the tree exactly once. Calling both setParent AND addChild adds the
+            // child to parent.children twice -> the part appears twice in the vessel
+            // part list and FAR's voxel dict throws "same key".
+            p.parent = parentWing;
+            parentWing.addChild(p);
+            if (p.srfAttachNode != null)
+            {
+                p.srfAttachNode.attachedPart = parentWing;
+                p.srfAttachNode.owner = p;
+            }
+            p.attachMode = AttachModes.SRF_ATTACH;
+
+            if (EditorLogic.fetch != null && EditorLogic.fetch.ship != null)
+                EditorLogic.fetch.ship.Add(p);
+
+            // The part is now attached. Everything below is best-effort: if any step
+            // throws we still return the (already-attached) part, so the caller doesn't
+            // spawn a duplicate one-click fallback on top of it.
+            try
+            {
+                WingProcedural cs = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
+                if (cs != null)
+                {
+                    cs.isSetToDefaultValues = true;
+                    cs.isAttached = true;
+                    WingProcedural pw = FirstOfTypeOrDefault<WingProcedural>(parentWing.Modules);
+                    cs.isMirrored = pw != null && pw.isMirrored;
+                    configure(cs);
+                }
+
+                p.InitializeModules();
+                GameEvents.onEditorPartEvent.Fire(ConstructionEventType.PartCreated, p);
+                GameEvents.onEditorPartEvent.Fire(ConstructionEventType.PartAttached, p);
+            }
+            catch (Exception e) { Debug.LogWarning("[B9PW] post-attach step threw (part still attached): " + e); }
+
+            Debug.Log("[B9PW] auto-attached " + p.name + " (pid " + p.persistentId + ") to " + parentWing.name);
+            return p;
+        }
+
+        // Fallback: hand the pre-configured part to the cursor for a one-click place.
+        private void SpawnOnCursor(AvailablePart ap, Action<WingProcedural> configure)
+        {
+            EditorLogic.fetch.SpawnPart(ap);
+            Part csPart = EditorLogic.SelectedPart;
+            if (csPart == null)
+            {
+                Debug.LogError("[B9PW] SpawnPart produced no SelectedPart");
+                return;
+            }
+            WingProcedural cs = FirstOfTypeOrDefault<WingProcedural>(csPart.Modules);
+            if (cs != null)
+            {
+                cs.isSetToDefaultValues = true;
+                configure(cs);
+            }
+        }
+
+        // --- TexturesUnlimited colour copy ---
+        // Colours live in each KSPTextureSwitch.persistentData (per section: surface,
+        // section, leading edge, trailing edge). Set before the new part starts so its
+        // TU module applies them. Best-effort; no-op without TU.
+        private static List<PartModule> TextureSwitches(Part p)
+        {
+            List<PartModule> list = new List<PartModule>();
+            if (p == null) return list;
+            foreach (PartModule m in p.Modules)
+                if (m.moduleName == "KSPTextureSwitch")
+                    list.Add(m);
+            return list;
+        }
+
+        private static string GetTSField(PartModule m, string field)
+        {
+            System.Reflection.FieldInfo f = m.GetType().GetField(field);
+            return f != null ? f.GetValue(m) as string : null;
+        }
+
+        private static void SetTSData(PartModule m, string persistentData)
+        {
+            if (persistentData == null) return;
+            System.Reflection.FieldInfo f = m.GetType().GetField("persistentData");
+            if (f != null) f.SetValue(m, persistentData);
+        }
+
+        // Split: apply the wing's trailing-edge colour to every section of the surface.
+        private static void CopyTrailingColourToAll(Part wing, Part cs)
+        {
+            try
+            {
+                List<PartModule> srcs = TextureSwitches(wing);
+                if (srcs.Count == 0) return;
+                PartModule trail = null;
+                foreach (PartModule m in srcs)
+                {
+                    string s = GetTSField(m, "sectionName");
+                    if (s != null && s.ToLower().Contains("trailing")) { trail = m; break; }
+                }
+                if (trail == null) trail = srcs[srcs.Count - 1];
+                string pd = GetTSField(trail, "persistentData");
+                foreach (PartModule dm in TextureSwitches(cs))
+                    SetTSData(dm, pd);
+            }
+            catch (Exception e) { Debug.LogWarning("[B9PW] CopyTrailingColourToAll failed: " + e); }
+        }
+
+        // Bisect: copy each section's colour from the source surface to the new one.
+        private static void CopyColoursBySection(Part src, Part dst)
+        {
+            try
+            {
+                List<PartModule> s = TextureSwitches(src);
+                List<PartModule> d = TextureSwitches(dst);
+                for (int i = 0; i < d.Count && i < s.Count; i++)
+                    SetTSData(d[i], GetTSField(s[i], "persistentData"));
+            }
+            catch (Exception e) { Debug.LogWarning("[B9PW] CopyColoursBySection failed: " + e); }
+        }
+
+        // Link parts as a mirror-symmetry group so the editor moves/deletes them together
+        // instead of duplicating on edit.
+        private static void LinkMirrorSymmetry(List<Part> parts)
+        {
+            if (parts == null || parts.Count < 2) return;
+            foreach (Part a in parts)
+            {
+                a.symMethod = SymmetryMethod.Mirror;
+                a.symmetryCounterparts.Clear();
+                foreach (Part b in parts)
+                    if (b != a) a.symmetryCounterparts.Add(b);
+            }
+        }
+
+        // Reflect a world pose across the vessel's mirror-symmetry plane (through the root
+        // part, normal = root's right axis). A control-surface counterpart must be a true
+        // reflection of the primary, not the same relative pose (verified against a
+        // hand-placed reference craft: counterpart rot = reflected primary rot).
+        private static void ReflectAcrossSymmetryPlane(Vector3 pos, Quaternion rot, out Vector3 rPos, out Quaternion rRot)
+        {
+            Vector3 n = Vector3.right;
+            Vector3 p0 = Vector3.zero;
+            if (EditorLogic.SortedShipList != null && EditorLogic.SortedShipList.Count > 0)
+            {
+                Part root = EditorLogic.SortedShipList[0];
+                n = root.transform.right.normalized;
+                p0 = root.transform.position;
+            }
+            rPos = pos - 2f * Vector3.Dot(pos - p0, n) * n;
+            Vector3 v = new Vector3(rot.x, rot.y, rot.z);
+            Vector3 vr = -v + 2f * Vector3.Dot(v, n) * n;
+            rRot = new Quaternion(vr.x, vr.y, vr.z, rot.w);
+        }
+
+        // World position where a full-span split control surface's origin should sit.
+        // Derived from a hand-placed reference craft: in the wing's transform-local frame
+        // it is (span/2, -(trailing-edge chord), 0) -> X = span mid, Y = negative chord to
+        // the trailing edge, Z = 0 (thickness, flush).
+        private Vector3 TrailingEdgeMidspanWorld()
+        {
+            float rootTZ = sharedBaseWidthRoot * 0.5f - sharedBaseOffsetRoot;
+            float tipTZ = sharedBaseWidthTip * 0.5f + sharedBaseOffsetTip;
+            float midTZ = (rootTZ + tipTZ) * 0.5f;
+            Vector3 local = new Vector3(sharedBaseLength * 0.5f, -midTZ, 0f);
+            return part.transform.position + part.transform.rotation * local;
+        }
+
+        // Rotation for a control surface attached to a wing's trailing edge: the wing's
+        // rotation turned 180 deg about its local up axis, plus a small tilt about the
+        // chord axis so the surface's span follows the wing's (swept) trailing edge.
+        // Both terms were verified against a hand-placed reference craft.
+        private static Quaternion CtrlSrfRotationForWing(WingProcedural wing)
+        {
+            float rootTZ = wing.sharedBaseWidthRoot * 0.5f - wing.sharedBaseOffsetRoot;
+            float tipTZ = wing.sharedBaseWidthTip * 0.5f + wing.sharedBaseOffsetTip;
+            float tilt = Mathf.Atan2(rootTZ - tipTZ, wing.sharedBaseLength) * Mathf.Rad2Deg;
+            return wing.part.transform.rotation
+                 * Quaternion.AngleAxis(tilt, Vector3.forward)
+                 * Quaternion.AngleAxis(180f, Vector3.up);
+        }
+
+        /// <summary>
+        /// Split this wing's trailing edge off into a separate control-surface part
+        /// (TypeB) and square off the wing's own rear so it becomes a flat
+        /// (rectangular) face for the surface to hinge against. The pre-configured
+        /// surface is handed to the editor on the cursor; one click attaches it, and
+        /// KSP creates symmetry counterparts natively. (Driving the private editor
+        /// attach directly desyncs the editor FSM and produces NREs, so we let the
+        /// FSM own the attach.)
+        /// </summary>
+        private void SplitTrailingEdgeIntoControlSurface()
+        {
+            if (isCtrlSrf || !isAttached)
+                return;
+
+            // Capture the trailing-edge shape being moved out onto the surface.
+            float teType = sharedEdgeTypeTrailing;
+            float teRoot = sharedEdgeWidthTrailingRoot;
+            float teTip = sharedEdgeWidthTrailingTip;
+            if (teRoot <= 0f && teTip <= 0f)
+                return;
+
+            if (EditorLogic.fetch == null)
+                return;
+
+            // Match the wing's own variant, so a supersonic wing splits into a
+            // supersonic control surface rather than the stock one.
+            AvailablePart ap = ResolveCtrlSrfPart(part);
+            if (ap == null)
+            {
+                Debug.LogError("[B9PW] Split: control surface part not found");
+                return;
+            }
+
+            // Configure the surface to reproduce this wing's trailing edge and colours
+            // (kept because isSetToDefaultValues is set before SetupFields runs).
+            // The control surface spans the wing's TRAILING EDGE, which on a swept wing
+            // is longer than the span: its length is the hypotenuse of the span and the
+            // chordwise travel of the trailing edge (root TE Z - tip TE Z). Verified to
+            // <1% against two hand-fixed reference crafts. (rootTZ/tipTZ use B9's own
+            // asymmetric offset convention: TE chord(Z) = width/2 -/+ offset.)
+            float splitRootTZ = sharedBaseWidthRoot * 0.5f - sharedBaseOffsetRoot;
+            float splitTipTZ = sharedBaseWidthTip * 0.5f + sharedBaseOffsetTip;
+            float splitDeltaTZ = splitRootTZ - splitTipTZ;
+            float splitTELength = Mathf.Sqrt(sharedBaseLength * sharedBaseLength
+                                           + splitDeltaTZ * splitDeltaTZ);
+            // Constant offset that keeps the raked control's edges parallel to the wing.
+            // Regressed from 4 hand-fixed crafts (0-49deg sweep, lengths 2.0-4.6): the
+            // offset is -tan(TE sweep) = -deltaTZ/length, size-independent (R^2=0.998).
+            // Applied equally to root and tip (the strip runs straight along the TE).
+            // Guard a degenerate (near-zero) span: the divisions below would give NaN/Inf and
+            // spawn a broken control. Fall back to neutral values (no rake offset, no te scale).
+            bool splitDegenerate = sharedBaseLength < 1e-4f || splitTELength < 1e-4f;
+            float splitTanSweep = splitDegenerate ? 0f : splitDeltaTZ / sharedBaseLength;   // = tan(TE sweep)
+            float splitCtrlOffset = -splitTanSweep;
+            // The raked control measures te-width perpendicular to the TE-aligned span,
+            // while the wing measures it perpendicular to the wing span; the two differ by
+            // the sweep angle, so controlTe = wingTe * cos(sweep) = wingTe * length/TElength.
+            // Geometric (not a fit); matches hand-matched crafts to <1% at 9-49deg sweep.
+            float splitTeScale = splitDegenerate ? 1f : sharedBaseLength / splitTELength;
+
+            Action<WingProcedural> cfg = cs =>
+            {
+                cs.sharedBaseLength = splitTELength;
+                // Zero body width: the control is purely the reproduced (curved) trailing
+                // edge, with no flat hinge strip. The wing's te-width covers only the curved
+                // part, so any body chord here would overshoot the original trailing edge.
+                cs.sharedBaseWidthRoot = 0f;
+                cs.sharedBaseWidthTip = 0f;
+                cs.sharedBaseThicknessRoot = sharedBaseThicknessRoot;
+                cs.sharedBaseThicknessTip = sharedBaseThicknessTip;
+                // Constant offset (root==tip) = -tan(TE sweep); see splitCtrlOffset above.
+                cs.sharedBaseOffsetRoot = splitCtrlOffset;
+                cs.sharedBaseOffsetTip = splitCtrlOffset;
+                // Wing edge types are {1 No edge, 2 Rounded, 3 Biconvex, 4 Triangular};
+                // control-surface types are {1 Rounded, 2 Biconvex, 3 Triangular} - i.e.
+                // offset by one - so map the wing's shape to the equivalent ctrl type.
+                cs.sharedEdgeTypeTrailing = Mathf.Clamp(teType - 1f, 1f, 3f);
+                cs.sharedEdgeWidthTrailingRoot = teRoot * splitTeScale;
+                cs.sharedEdgeWidthTrailingTip = teTip * splitTeScale;
+                CopyTrailingColourToAll(part, cs.part);
+            };
+
+            // Auto-attach at the wing's trailing-edge mid-span with the calibrated pose;
+            // fall back to one-click place on any failure.
+            List<Part> attached = new List<Part>();
+            Part primary = null;
+            try { primary = AttachCtrlSrfTo(ap, part, TrailingEdgeMidspanWorld(), CtrlSrfRotationForWing(this), cfg); }
+            catch (Exception e) { Debug.LogError("[B9PW] Split auto-attach failed, falling back to one-click: " + e); }
+
+            if (primary == null)
+            {
+                SpawnOnCursor(ap, cfg);
+            }
+            else
+            {
+                attached.Add(primary);
+                // Place each counterpart as a true reflection of the primary's pose so it
+                // mirrors correctly (same relative pose gave a rotated, un-mirrored copy).
+                Vector3 primaryPos = TrailingEdgeMidspanWorld();
+                Quaternion primaryRot = CtrlSrfRotationForWing(this);
+                foreach (Part p in part.symmetryCounterparts)
+                {
+                    WingProcedural w = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
+                    if (w == null) continue;
+                    ReflectAcrossSymmetryPlane(primaryPos, primaryRot, out Vector3 cPos, out Quaternion cRot);
+                    try
+                    {
+                        Part cp = AttachCtrlSrfTo(ap, p, cPos, cRot, cfg);
+                        if (cp != null) attached.Add(cp);
+                    }
+                    catch (Exception e) { Debug.LogError("[B9PW] Split counterpart auto-attach failed: " + e); }
+                }
+                LinkMirrorSymmetry(attached);
+            }
+
+            // Square off this wing and its counterparts: zero the trailing edge so the
+            // rear face is flat (the rectangular cross-section the surface hinges against).
+            ZeroTrailingEdge(this);
+            foreach (Part p in part.symmetryCounterparts)
+            {
+                WingProcedural sym = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
+                if (sym != null)
+                    ZeroTrailingEdge(sym);
+            }
+
+            if (EditorLogic.fetch != null)
+                GameEvents.onEditorShipModified.Fire(EditorLogic.fetch.ship);
+        }
+
+        private static void ZeroTrailingEdge(WingProcedural wing)
+        {
+            wing.sharedEdgeWidthTrailingRoot = 0f;
+            wing.sharedEdgeWidthTrailingTip = 0f;
+            wing.UpdateGeometry(true);
+        }
+
+        #endregion Split trailing edge into control surface
+
+        #region Follow parent wing
+
+        // Keeps an attached control surface tracking its parent wing's span/sweep/position
+        // (editor only) while keeping its own shape (trailing-edge width + edge type). The
+        // wing->control mapping is the same one the split derives: length = swept-TE length,
+        // offset = -tan(sweep), pose = trailing-edge midspan + sweep tilt. te-width is NOT
+        // re-derived - the split zeroed the wing's te, so the wing no longer carries it, and
+        // keeping the control's te is the "keep shape" behaviour.
+        private bool fpInit = false;
+        private float fpLen, fpWR, fpWT, fpOR, fpOT;
+        // The control's span as FRACTIONS of the wing's trailing edge: how long it is
+        // (lengthFrac) and where its centre sits relative to TE midspan (centreFrac, in
+        // -0.5..+0.5 along the TE). Preserving these is what keeps a flaps/aileron setup
+        // intact - each piece owns a portion of the edge, not the whole thing.
+        private float fpLengthFrac = 1f, fpCentreFrac = 0f;
+        // The control's rotation expressed IN the wing's trailing-edge frame. Re-applying
+        // this to the rebuilt frame tracks sweep without ever re-orienting the control
+        // itself - so a control keeps whichever way round it already sits.
+        private Quaternion fpRelRot = Quaternion.identity;
+
+        private void FollowParentWing()
+        {
+            if (!HighLogic.LoadedSceneIsEditor || !isCtrlSrf || !isAttached || bisectMode)
+                return;
+            if (part.parent == null || !part.parent.Modules.Contains<WingProcedural>())
+                return;
+            WingProcedural wing = FirstOfTypeOrDefault<WingProcedural>(part.parent.Modules);
+            if (wing == null || wing.isCtrlSrf)
+                return;
+
+            bool changed =
+                wing.sharedBaseLength != fpLen
+                || wing.sharedBaseWidthRoot != fpWR || wing.sharedBaseWidthTip != fpWT
+                || wing.sharedBaseOffsetRoot != fpOR || wing.sharedBaseOffsetTip != fpOT;
+
+            fpLen = wing.sharedBaseLength;
+            fpWR = wing.sharedBaseWidthRoot; fpWT = wing.sharedBaseWidthTip;
+            fpOR = wing.sharedBaseOffsetRoot; fpOT = wing.sharedBaseOffsetTip;
+
+            // While the wing is untouched, keep re-reading where this control sits on the
+            // edge, so moving/resizing it by hand redefines what gets preserved. The first
+            // pass lands here too, so loading a craft never reshapes anything.
+            if (!fpInit || !changed)
+            {
+                fpInit = true;
+                CaptureSpanFractions(wing);
+                return;
+            }
+
+            ApplyFollow(wing);
+        }
+
+        // Trailing-edge frame of the wing, in the wing's PART transform space:
+        // X = span (root at 0 -> tip at +length), Y = chord (trailing edge at -TZ),
+        // Z = thickness. That's the convention the gizmo drag code and
+        // TrailingEdgeMidspanWorld use - NOT the mesh builder's frame (which is
+        // X=thickness, Y=chord, Z=span; the mesh child is rotated relative to the part).
+        private void TrailingEdgeFrame(WingProcedural wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ)
+        {
+            float rootTZ = wing.sharedBaseWidthRoot * 0.5f - wing.sharedBaseOffsetRoot;
+            float tipTZ = wing.sharedBaseWidthTip * 0.5f + wing.sharedBaseOffsetTip;
+            dTZ = rootTZ - tipTZ;
+            teDirLocal = new Vector3(wing.sharedBaseLength, dTZ, 0f).normalized;
+            teMid = wing.TrailingEdgeMidspanWorld();
+            teLen = Mathf.Sqrt(wing.sharedBaseLength * wing.sharedBaseLength + dTZ * dTZ);
+        }
+
+        private void CaptureSpanFractions(WingProcedural wing)
+        {
+            TrailingEdgeFrame(wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float _);
+            if (teLen < 1e-4f)
+                return;
+            Vector3 teDir = wing.part.transform.TransformDirection(teDirLocal);
+            fpLengthFrac = sharedBaseLength / teLen;
+            fpCentreFrac = Vector3.Dot(part.transform.position - teMid, teDir) / teLen;
+            fpRelRot = Quaternion.Inverse(TrailingEdgeFrameWorld(wing, teDirLocal)) * part.transform.rotation;
+        }
+
+        // Orthonormal frame sitting on the wing's trailing edge: forward = along the edge,
+        // up = the wing's thickness axis (part-local Z, perpendicular to the edge since the
+        // edge lies in the span/chord plane).
+        private Quaternion TrailingEdgeFrameWorld(WingProcedural wing, Vector3 teDirLocal)
+        {
+            return wing.part.transform.rotation * Quaternion.LookRotation(teDirLocal, Vector3.forward);
+        }
+
+        private void ApplyFollow(WingProcedural wing)
+        {
+            TrailingEdgeFrame(wing, out Vector3 teMid, out Vector3 teDirLocal, out float teLen, out float dTZ);
+            if (wing.sharedBaseLength < 1e-4f || teLen < 1e-4f)
+                return;
+            Vector3 teDir = wing.part.transform.TransformDirection(teDirLocal);
+
+            // Rebuild the edge frame and re-apply the control's stored rotation WITHIN it.
+            // This is absolute (no roll drift, unlike an incremental FromToRotation delta,
+            // which leaves roll about the span free), yet it never re-orients the control
+            // itself - so a hand-placed or mirrored control keeps whichever way round it
+            // sits. Snapping to CtrlSrfRotationForWing instead forces the freshly-split
+            // pose onto every control, which flipped root/tip end-for-end.
+            part.transform.rotation = TrailingEdgeFrameWorld(wing, teDirLocal) * fpRelRot;
+
+            // Keep this control's slice of the edge: same fraction of the length, same
+            // station along it. Thickness / te-width are its own shape - left alone.
+            part.transform.position = teMid + teDir * (fpCentreFrac * teLen);
+            sharedBaseLength = fpLengthFrac * teLen;
+            sharedBaseOffsetRoot = -dTZ / wing.sharedBaseLength;
+            sharedBaseOffsetTip = sharedBaseOffsetRoot;
+
+            // Field changes are picked up by CheckAllFieldValues later this frame, which
+            // fires UpdateGeometry; no explicit call needed here.
+        }
+
+        #endregion Follow parent wing
+
+        #region Bisect control surface
+
+        // Interactive "bisect": click the button, mouse over the surface to place a
+        // chordwise cut line, click to split the surface spanwise into an inboard half
+        // (this part, cropped) and an outboard half (a new TypeB placed on the cursor).
+        private bool bisectMode = false;
+        // After committing a cut we must hold the part-pick input lock for a couple more
+        // frames: the editor's own pick handler runs LATER in the same frame as our commit
+        // click, so releasing the lock immediately let that click grab the just-bisected
+        // part. Count down in Update() and release only once the click has been consumed.
+        private int bisectUnlockFrames = 0;
+        // Overlay that outlines the cut cross-section, drawn through the part (x-ray).
+        private static GameObject xsecObj;
+        private static MeshFilter xsecFilter;
+        private static Mesh xsecMesh;
+        private static Material xsecMat;
+        private static readonly List<Vector3> xsecSegs = new List<Vector3>();
+        private static readonly List<Vector3> xsecVerts = new List<Vector3>();
+        private static readonly List<int> xsecTris = new List<int>();
+        private static readonly List<Color> xsecCols = new List<Color>();
+
+        private void ToggleBisectMode()
+        {
+            if (bisectMode)
+                ExitBisectMode();
+            else
+                EnterBisectMode();
+        }
+
+        private void EnterBisectMode()
+        {
+            bisectMode = true;
+            // Cancel any pending post-commit unlock countdown: if we re-enter bisect within a
+            // few frames of a previous commit, letting it fire would RemoveControlLock mid-bisect.
+            bisectUnlockFrames = 0;
+            // Block the editor from picking/placing parts while we handle clicks
+            // ourselves (EditorLogic.Lock didn't stop the pick, so the commit click grabbed
+            // the part under the cursor).
+            InputLockManager.SetControlLock(ControlTypes.EDITOR_PAD_PICK_PLACE | ControlTypes.EDITOR_PAD_PICK_COPY, "B9PWBisect");
+        }
+
+        private void ExitBisectMode()
+        {
+            bisectMode = false;
+            InputLockManager.RemoveControlLock("B9PWBisect");
+            HideBisectOverlay();
+        }
+
+        private void BisectUpdate()
+        {
+            if (Input.GetKeyDown(KeyCode.Mouse1) || Input.GetKeyDown(KeyCode.Escape))
+            {
+                ExitBisectMode();
+                return;
+            }
+
+            Camera cam = EditorLogic.fetch != null ? EditorLogic.fetch.editorCamera : null;
+            if (cam == null)
+            {
+                HideBisectOverlay();
+                return;
+            }
+
+            if (!BisectRaycast(cam, out Vector3 hit, out Vector3 normal, out float f, out Vector3 root, out Vector3 tip))
+            {
+                HideBisectOverlay();
+                return;
+            }
+
+            // Outline the cut cross-section at the cursor station. Orient the cut plane
+            // PARALLEL to the wing tip/root chords (streamwise) rather than perpendicular
+            // to the control's raked span: the plane normal is the parent wing's span axis
+            // (local +X). Falls back to the control span if there's no parent.
+            Vector3 station = root + (tip - root) * f;
+            Vector3 cutNormal = part.parent != null
+                ? part.parent.transform.right.normalized
+                : (tip - root).normalized;
+            ShowCrossSection(station, cutNormal, cam.transform.position);
+
+            // Commit on a full left-click (release), so the same event doesn't also
+            // place the part SpawnPart puts on the cursor.
+            if (Input.GetMouseButtonUp(0))
+            {
+                Debug.Log("[B9PW] Bisect at f=" + f.ToString("F3"));
+                BisectAt(f);
+                // Leave bisect mode but HOLD the input lock a few frames: the editor's own
+                // pick handler runs later THIS frame, so releasing now let the commit click
+                // grab the just-cut part. Update() drops the lock once the click is consumed.
+                bisectMode = false;
+                HideBisectOverlay();
+                bisectUnlockFrames = 3;
+            }
+        }
+
+        // Raycast the cursor onto this control surface and return the hit plus the
+        // spanwise fraction f (0 at the root end, 1 at the tip end). Span endpoints come
+        // from the ctrl-frame mesh bounds so we don't depend on the local axis convention.
+        private bool BisectRaycast(Camera cam, out Vector3 hit, out Vector3 normal, out float f, out Vector3 root, out Vector3 tip)
+        {
+            hit = Vector3.zero; normal = Vector3.up; f = 0f; root = Vector3.zero; tip = Vector3.zero;
+
+            Ray ray = cam.ScreenPointToRay(Input.mousePosition);
+            bool found = false;
+            float best = float.MaxValue;
+            foreach (RaycastHit h in Physics.RaycastAll(ray, 2000f))
+            {
+                if (h.collider != null && h.collider.transform.IsChildOf(part.transform) && h.distance < best)
+                {
+                    hit = h.point; normal = h.normal; best = h.distance; found = true;
+                }
+            }
+            if (!found)
+                return false;
+
+            if (!SpanEndpoints(out root, out tip))
+                return false;
+
+            float span = Vector3.Distance(root, tip);
+            if (span < 0.01f)
+                return false;
+            f = Mathf.Clamp01(Vector3.Dot(hit - root, (tip - root) / span) / span);
+            return true;
+        }
+
+        // World-space span endpoints of this control surface (root = inboard end,
+        // nearer the parent wing). Derived from the ctrl-frame mesh bounds so we don't
+        // depend on the local axis convention.
+        private bool SpanEndpoints(out Vector3 root, out Vector3 tip)
+        {
+            root = Vector3.zero; tip = Vector3.zero;
+            MeshFilter mf = meshFilterCtrlFrame;
+            if (mf == null || mf.sharedMesh == null)
+                return false;
+
+            Bounds b = mf.sharedMesh.bounds;
+            Vector3 ext = b.extents;
+            Vector3 axis; float halfLen;
+            if (ext.x >= ext.y && ext.x >= ext.z) { axis = Vector3.right; halfLen = ext.x; }
+            else if (ext.y >= ext.z) { axis = Vector3.up; halfLen = ext.y; }
+            else { axis = Vector3.forward; halfLen = ext.z; }
+
+            Vector3 e0 = mf.transform.TransformPoint(b.center + axis * halfLen);
+            Vector3 e1 = mf.transform.TransformPoint(b.center - axis * halfLen);
+            if (part.parent != null)
+            {
+                // Root is the end at the parent wing's ROOT, i.e. span-position ~0 (the wing
+                // origin sits at its root). Compare the MAGNITUDE of each end's projection
+                // onto the wing span axis and take the smaller as root. Using magnitude (not
+                // signed) makes this independent of which way transform.right points (it aims
+                // at the tip on these wings, which flipped a signed test); and because the
+                // root CHORD is perpendicular to the span it doesn't skew the projection, so
+                // this also holds when the root chord is longer than the span (steep sweep).
+                Vector3 sp = part.parent.transform.right.normalized;
+                Vector3 po = part.parent.transform.position;
+                float x0 = Mathf.Abs(Vector3.Dot(e0 - po, sp));
+                float x1 = Mathf.Abs(Vector3.Dot(e1 - po, sp));
+                if (x0 <= x1) { root = e0; tip = e1; } else { root = e1; tip = e0; }
+            }
+            else
+            {
+                Vector3 pw = part.transform.position;
+                if (Vector3.Distance(e0, pw) <= Vector3.Distance(e1, pw)) { root = e0; tip = e1; }
+                else { root = e1; tip = e0; }
+            }
+            return true;
+        }
+
+        private void BisectAt(float f)
+        {
+            if (f <= 0.03f || f >= 0.97f)
+            {
+                Debug.Log("[B9PW] Bisect: cut too close to an end, ignoring");
+                return;
+            }
+
+            float L = sharedBaseLength;
+            // Cross-section interpolated at the cut (fields are linear root->tip).
+            float cutWidth = Mathf.Lerp(sharedBaseWidthRoot, sharedBaseWidthTip, f);
+            float cutThk = Mathf.Lerp(sharedBaseThicknessRoot, sharedBaseThicknessTip, f);
+            float cutEdge = Mathf.Lerp(sharedEdgeWidthTrailingRoot, sharedEdgeWidthTrailingTip, f);
+            // Offset model (per user's calibration): the cut edge on BOTH pieces takes the
+            // original ROOT offset, so bisected controls stay parallel; only the outboard
+            // tip keeps the original tip offset. i.e. inboard=(rootOff, rootOff),
+            // outboard=(rootOff, tipOff).
+            float rootOffset = sharedBaseOffsetRoot;
+            // Original tip values, for the outboard piece.
+            float tipWidth = sharedBaseWidthTip;
+            float tipOffset = sharedBaseOffsetTip;
+            float tipThk = sharedBaseThicknessTip;
+            float tipEdge = sharedEdgeWidthTrailingTip;
+            float teType = sharedEdgeTypeTrailing;
+
+            // Outboard [f,1] piece geometry.
+            Action<WingProcedural> cfg = cs =>
+            {
+                cs.sharedBaseLength = (1f - f) * L;
+                cs.sharedBaseWidthRoot = cutWidth;
+                cs.sharedBaseWidthTip = tipWidth;
+                cs.sharedBaseOffsetRoot = rootOffset;      // cut edge = original root offset
+                cs.sharedBaseOffsetTip = tipOffset;        // original tip, unchanged
+                cs.sharedBaseThicknessRoot = cutThk;
+                cs.sharedBaseThicknessTip = tipThk;
+                cs.sharedEdgeTypeTrailing = teType;
+                cs.sharedEdgeWidthTrailingRoot = cutEdge;
+                cs.sharedEdgeWidthTrailingTip = tipEdge;
+                CopyColoursBySection(part, cs.part);
+            };
+
+            // Both halves must stay the same part as the surface being bisected.
+            AvailablePart ap = part.partInfo ?? ResolveCtrlSrfPart(part);
+            if (ap == null)
+            {
+                Debug.LogError("[B9PW] Bisect: control surface part not found");
+                return;
+            }
+
+            // Auto-attach the outboard piece to the parent wing at the outboard span
+            // station (computed before cropping); fall back to one-click for the primary.
+            List<Part> attached = new List<Part>();
+            Part primary = null;
+            bool haveParent = part.parent != null;
+            bool haveSpan = SpanEndpoints(out Vector3 root, out Vector3 tip);
+            Debug.Log("[B9PW] Bisect: f=" + f.ToString("F3") + " parent=" + haveParent + " span=" + haveSpan);
+            if (haveParent && haveSpan)
+            {
+                // Base the outboard centre on the surface ORIGIN (which sits on the
+                // trailing-edge line), not the mesh-bounds centre (which is offset back
+                // by ~half the chord and caused the outboard gap). Origin is at the span
+                // centre; the outboard [f,1] centre is f/2*L toward the tip.
+                Vector3 obc = part.transform.position + (tip - root).normalized * (f * 0.5f * sharedBaseLength);
+                try { primary = AttachCtrlSrfTo(ap, part.parent, obc, part.transform.rotation, cfg); }
+                catch (Exception e) { Debug.LogError("[B9PW] Bisect auto-attach EXC -> one-click: " + e); }
+            }
+            else
+            {
+                Debug.LogError("[B9PW] Bisect: guard failed (parent=" + haveParent + ", span=" + haveSpan + ") -> one-click");
+            }
+
+            if (primary == null)
+            {
+                SpawnOnCursor(ap, cfg);
+            }
+            else
+            {
+                attached.Add(primary);
+                foreach (Part p in part.symmetryCounterparts)
+                {
+                    WingProcedural sc = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
+                    if (sc != null && p.parent != null && sc.SpanEndpoints(out Vector3 r2, out Vector3 t2))
+                    {
+                        Vector3 obc2 = sc.part.transform.position + (t2 - r2).normalized * (f * 0.5f * sc.sharedBaseLength);
+                        try
+                        {
+                            Part cp = AttachCtrlSrfTo(ap, p.parent, obc2, p.transform.rotation, cfg);
+                            if (cp != null) attached.Add(cp);
+                        }
+                        catch (Exception e) { Debug.LogError("[B9PW] Bisect counterpart auto-attach failed: " + e); }
+                    }
+                }
+                LinkMirrorSymmetry(attached);
+            }
+
+            // Crop this part (and its symmetry counterparts) to the inboard [0,f] half.
+            // Inboard cut edge (its tip) takes the original ROOT offset -> inboard stays a
+            // constant (rootOff,rootOff) strip.
+            CropInboard(this, f, L, cutWidth, rootOffset, cutThk, cutEdge);
+            foreach (Part p in part.symmetryCounterparts)
+            {
+                WingProcedural sym = FirstOfTypeOrDefault<WingProcedural>(p.Modules);
+                if (sym != null)
+                    CropInboard(sym, f, L, cutWidth, rootOffset, cutThk, cutEdge);
+            }
+
+            if (EditorLogic.fetch != null)
+                GameEvents.onEditorShipModified.Fire(EditorLogic.fetch.ship);
+        }
+
+        private static void CropInboard(WingProcedural cs, float f, float L, float cutWidth, float cutTipOffset, float cutThk, float cutEdge)
+        {
+            // The ctrl-surface mesh is centred on the part origin, so shortening it
+            // re-centres and shifts the inboard edge. Record the root edge, crop, then
+            // translate the part to put the root edge back where it was.
+            bool haveRoot = cs.SpanEndpoints(out Vector3 rootBefore, out Vector3 tipBefore);
+
+            cs.sharedBaseLength = f * L;
+            cs.sharedBaseWidthTip = cutWidth;
+            // Inboard root offset is left unchanged; its cut edge (tip) takes the supplied
+            // offset (the original root offset) so the inboard piece stays a constant strip.
+            cs.sharedBaseOffsetTip = cutTipOffset;
+            cs.sharedBaseThicknessTip = cutThk;
+            cs.sharedEdgeWidthTrailingTip = cutEdge;
+            cs.UpdateGeometry(true);
+
+            if (haveRoot && cs.SpanEndpoints(out Vector3 rootAfter, out Vector3 tipAfter))
+                cs.part.transform.position += rootBefore - rootAfter;
+        }
+
+        // Chosen so the outline reads as a bold line without hiding the profile. World
+        // units; tunable.
+        private const float xsecHalfWidth = 0.015f;
+
+        // Slice the part's ctrl-surface meshes at the given plane and draw the resulting
+        // cross-section outline as a camera-facing ribbon that shows through the part.
+        private void ShowCrossSection(Vector3 planePoint, Vector3 planeNormal, Vector3 camPos)
+        {
+            xsecSegs.Clear();
+            SliceMesh(meshFilterCtrlFrame, planePoint, planeNormal, xsecSegs);
+            SliceMesh(meshFilterCtrlSurface, planePoint, planeNormal, xsecSegs);
+            if (meshFiltersCtrlEdge != null)
+                foreach (MeshFilter e in meshFiltersCtrlEdge)
+                    SliceMesh(e, planePoint, planeNormal, xsecSegs);
+
+            if (xsecSegs.Count < 2)
+            {
+                HideBisectOverlay();
+                return;
+            }
+
+            EnsureXsecObjects();
+            BuildThickLineMesh(xsecSegs, camPos, xsecHalfWidth);
+            xsecObj.SetActive(true);
+        }
+
+        // Turn a list of world-space line segments (consecutive point pairs) into a mesh
+        // of camera-facing quads so the outline has visible width from any angle.
+        private static void BuildThickLineMesh(List<Vector3> segs, Vector3 camPos, float halfWidth)
+        {
+            xsecVerts.Clear(); xsecTris.Clear(); xsecCols.Clear();
+            for (int i = 0; i + 1 < segs.Count; i += 2)
+            {
+                Vector3 a = segs[i], b = segs[i + 1];
+                Vector3 dir = b - a;
+                Vector3 view = camPos - (a + b) * 0.5f;
+                Vector3 side = Vector3.Cross(dir, view);
+                if (side.sqrMagnitude < 1e-9f)
+                    continue;
+                side = side.normalized * halfWidth;
+                int bi = xsecVerts.Count;
+                xsecVerts.Add(a - side); xsecVerts.Add(a + side); xsecVerts.Add(b + side); xsecVerts.Add(b - side);
+                for (int k = 0; k < 4; k++) xsecCols.Add(Color.yellow);
+                xsecTris.Add(bi); xsecTris.Add(bi + 1); xsecTris.Add(bi + 2);
+                xsecTris.Add(bi); xsecTris.Add(bi + 2); xsecTris.Add(bi + 3);
+            }
+            xsecMesh.Clear();
+            xsecMesh.SetVertices(xsecVerts);
+            xsecMesh.SetColors(xsecCols);
+            xsecMesh.SetTriangles(xsecTris, 0);
+            xsecMesh.RecalculateBounds();
+        }
+
+        private static void SliceMesh(MeshFilter mf, Vector3 p, Vector3 n, List<Vector3> segs)
+        {
+            if (mf == null || mf.sharedMesh == null || !mf.gameObject.activeInHierarchy)
+                return;
+
+            Mesh m = mf.sharedMesh;
+            Vector3[] v = m.vertices;
+            int[] tris = m.triangles;
+            Transform t = mf.transform;
+            for (int i = 0; i < tris.Length; i += 3)
+            {
+                Vector3 a = t.TransformPoint(v[tris[i]]);
+                Vector3 b = t.TransformPoint(v[tris[i + 1]]);
+                Vector3 c = t.TransformPoint(v[tris[i + 2]]);
+                float da = Vector3.Dot(a - p, n), db = Vector3.Dot(b - p, n), dc = Vector3.Dot(c - p, n);
+                int before = segs.Count;
+                if ((da < 0f) != (db < 0f)) segs.Add(Vector3.Lerp(a, b, da / (da - db)));
+                if ((db < 0f) != (dc < 0f)) segs.Add(Vector3.Lerp(b, c, db / (db - dc)));
+                if ((dc < 0f) != (da < 0f)) segs.Add(Vector3.Lerp(c, a, dc / (dc - da)));
+                // Keep only complete crossing segments (2 points).
+                if (segs.Count - before == 1) segs.RemoveAt(segs.Count - 1);
+            }
+        }
+
+        private static void EnsureXsecObjects()
+        {
+            if (xsecObj != null)
+                return;
+            xsecObj = new GameObject("B9PW_BisectXSection");
+            xsecFilter = xsecObj.AddComponent<MeshFilter>();
+            MeshRenderer mr = xsecObj.AddComponent<MeshRenderer>();
+            xsecMesh = new Mesh { name = "B9PW_BisectXSection" };
+            xsecFilter.sharedMesh = xsecMesh;
+
+            Shader sh = Shader.Find("Hidden/Internal-Colored");
+            xsecMat = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
+            xsecMat.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.Always); // draw through parts
+            xsecMat.SetInt("_ZWrite", 0);
+            xsecMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+            xsecMat.SetColor("_Color", Color.white);
+            mr.sharedMaterial = xsecMat;
+            mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            mr.receiveShadows = false;
+        }
+
+        private static void HideBisectOverlay()
+        {
+            if (xsecObj != null)
+                xsecObj.SetActive(false);
+        }
+
+        #endregion Bisect control surface
+
         #region Mod detection
 
         public static bool assembliesChecked = false;
@@ -1121,6 +2062,21 @@ namespace WingProcedural
 
             DebugTimerUpdate();
             UpdateUI();
+
+            // Release the deferred bisect-commit lock only after the editor has consumed
+            // the commit click (a frame or two later), so the click can't grab the part.
+            if (bisectUnlockFrames > 0 && --bisectUnlockFrames == 0)
+                InputLockManager.RemoveControlLock("B9PWBisect");
+
+            if (bisectMode)
+            {
+                BisectUpdate();
+                return;
+            }
+
+            // Control surfaces track their parent wing's span/sweep/pose (edits its shared
+            // fields + transform); the CheckAllFieldValues below then fires the geometry rebuild.
+            FollowParentWing();
 
             DeformWing();
             CheckAllFieldValues(out bool updateGeo, out bool updateAero);
@@ -1710,9 +2666,15 @@ namespace WingProcedural
                         // Trailing edge
                         else if (vp[i].y < -0.1f)
                         {
+                            // issue #19: scale the beyond-mating-line extent by the trailing-edge
+                            // width deviation. Only the interior tip sliver (ref y ~ -0.73) has any;
+                            // mating-ring verts at y = -0.5 are unaffected ((y+0.5)==0). Keeps the
+                            // sliver inside the edge shell (edge tip = -0.24*dev) for any width,
+                            // instead of protruding past it (and exposing an interior face) when the
+                            // trailing width drops below ~0.23. Identical to the old form at dev=1.
                             vp[i] = vp[i].z < 0f
-                                ? new Vector3(vp[i].x, vp[i].y + 0.5f - ctrlTipWidth, vp[i].z)
-                                : new Vector3(vp[i].x, vp[i].y + 0.5f - ctrlRootWidth, vp[i].z);
+                                ? new Vector3(vp[i].x, ((vp[i].y + 0.5f) * ctrlEdgeWidthDeviationTip) - ctrlTipWidth, vp[i].z)
+                                : new Vector3(vp[i].x, ((vp[i].y + 0.5f) * ctrlEdgeWidthDeviationRoot) - ctrlRootWidth, vp[i].z);
                         }
 
                         // Offset-based distortion
@@ -1796,6 +2758,10 @@ namespace WingProcedural
                         for (int i = 0; i < vp.Length; ++i)
                         {
                             // Thickness correction (X), edge width correction (Y) and span-based offset (Z)
+                            // This scales the edge Y about y=-0.5 = the MATING RING (verified against
+                            // the shipped .mu: edge mesh is y in [-0.5,-0.74]). So the seam is already
+                            // watertight at any width - do NOT change this. issue #19's exposed face is
+                            // a stray frame-mesh backing sliver; fixed in the ctrl-FRAME loop above.
                             vp[i] = vp[i].z < 0f
                                 ? new Vector3(vp[i].x * ctrlThicknessDeviationTip, ((vp[i].y + 0.5f) * ctrlEdgeWidthDeviationTip) - 0.5f, vp[i].z + 0.5f - geometricLength / 2f)
                                 : new Vector3(vp[i].x * ctrlThicknessDeviationRoot, ((vp[i].y + 0.5f) * ctrlEdgeWidthDeviationRoot) - 0.5f, vp[i].z - 0.5f + geometricLength / 2f);
@@ -3330,6 +4296,21 @@ namespace WingProcedural
                             DrawLimited(ref sharedColorELSaturation, sharedIncrementColor, sharedIncrementColorLarge, sharedColorLimits, Localizer.Format("#autoLOC_B9_Aerospace_WingStuff_1000059"), uiColorSliderColorsEL, 16, 0, true);		// #autoLOC_B9_Aerospace_WingStuff_1000059 = Saturation
                             DrawLimited(ref sharedColorELBrightness, sharedIncrementColor, sharedIncrementColorLarge, sharedColorLimits, Localizer.Format("#autoLOC_B9_Aerospace_WingStuff_1000060"), uiColorSliderColorsEL, 17, 0, true);		// #autoLOC_B9_Aerospace_WingStuff_1000060 = Brightness
                         }
+                    }
+                }
+
+                if (!isCtrlSrf && isAttached)
+                {
+                    if (GUILayout.Button("Split trailing edge into control surface", UIUtility.uiStyleButton))
+                    {
+                        SplitTrailingEdgeIntoControlSurface();
+                    }
+                }
+                if (isCtrlSrf && isAttached)
+                {
+                    if (GUILayout.Button(bisectMode ? "Bisecting - click surface (RMB cancels)" : "Bisect control surface", UIUtility.uiStyleButton))
+                    {
+                        ToggleBisectMode();
                     }
                 }
 
